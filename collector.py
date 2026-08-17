@@ -4,6 +4,7 @@ import sys
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 
 OMERO_HOST = os.getenv("OMERO_DB_HOST", "omero-postgres-server")
@@ -14,6 +15,11 @@ STATS_HOST = os.getenv("STATS_DB_HOST", "filestatistics-pg15")
 STATS_PORT = int(os.getenv("STATS_DB_PORT", "5432"))
 STATS_DB = os.getenv("STATS_DB_NAME", "omerofilestats")
 
+DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {
+    "false",
+    "0",
+    "no",
+}
 
 def required_env(name: str) -> str:
     value = os.getenv(name)
@@ -207,6 +213,80 @@ LEFT JOIN location_agg la
 ORDER BY fs.id;
 """
 
+UPSERT_FILESET_SQL = """
+INSERT INTO public.omero_fileset (
+    fileset_id,
+
+    owner_id,
+    username,
+    firstname,
+    lastname,
+
+    group_id,
+    group_name,
+
+    imported_at,
+
+    source_file_count,
+    image_count,
+    uncontained_image_count,
+    total_bytes,
+
+    source_files,
+    locations,
+
+    first_seen_at,
+    last_seen_at,
+    deleted_at
+)
+VALUES (
+    %(fileset_id)s,
+
+    %(owner_id)s,
+    %(username)s,
+    %(firstname)s,
+    %(lastname)s,
+
+    %(group_id)s,
+    %(group_name)s,
+
+    %(imported_at)s,
+
+    %(source_file_count)s,
+    %(image_count)s,
+    %(uncontained_image_count)s,
+    %(total_bytes)s,
+
+    %(source_files)s,
+    %(locations)s,
+
+    now(),
+    now(),
+    NULL
+)
+ON CONFLICT (fileset_id)
+DO UPDATE SET
+    owner_id = EXCLUDED.owner_id,
+    username = EXCLUDED.username,
+    firstname = EXCLUDED.firstname,
+    lastname = EXCLUDED.lastname,
+
+    group_id = EXCLUDED.group_id,
+    group_name = EXCLUDED.group_name,
+
+    imported_at = EXCLUDED.imported_at,
+
+    source_file_count = EXCLUDED.source_file_count,
+    image_count = EXCLUDED.image_count,
+    uncontained_image_count = EXCLUDED.uncontained_image_count,
+    total_bytes = EXCLUDED.total_bytes,
+
+    source_files = EXCLUDED.source_files,
+    locations = EXCLUDED.locations,
+
+    last_seen_at = now(),
+    deleted_at = NULL;
+"""
 
 def connect_omero():
     return psycopg.connect(
@@ -286,8 +366,32 @@ def validate_rows(rows):
             )
 
 
+def upsert_filesets(conn, rows):
+    records = []
+
+    for row in rows:
+        record = dict(row)
+
+        record["source_files"] = Jsonb(
+            row["source_files"]
+        )
+
+        record["locations"] = Jsonb(
+            row["locations"]
+        )
+
+        records.append(record)
+
+    with conn.cursor() as cur:
+        cur.executemany(
+            UPSERT_FILESET_SQL,
+            records,
+        )
+        
+
 def main():
-    print("OMERO storage collector - DRY RUN")
+    mode = "DRY RUN" if DRY_RUN else "WRITE MODE"
+    print(f"OMERO storage collector - {mode}")
     print()
 
     #
@@ -355,6 +459,30 @@ def main():
                 "Unexpected statistics database user."
             )
 
+        if not DRY_RUN:
+            print()
+            print("WRITE MODE ENABLED")
+            print(
+                f"Upserting {len(rows)} Filesets "
+                "into omero_fileset..."
+            )
+
+            upsert_filesets(conn, rows)
+
+            conn.commit()
+
+            stored_count = conn.execute(
+                """
+                SELECT count(*)
+                FROM public.omero_fileset
+                WHERE deleted_at IS NULL
+                """
+            ).fetchone()["count"]
+
+            print(
+                f"Active Filesets after UPSERT: {stored_count}"
+            )
+
     #
     # Dry-run report
     #
@@ -401,7 +529,10 @@ def main():
         )
 
     print()
-    print("DRY RUN COMPLETE - no database rows were written.")
+    if DRY_RUN:
+        print("DRY RUN COMPLETE - no database rows were written.")
+    else:
+        print("WRITE RUN COMPLETE.")
 
 
 if __name__ == "__main__":
