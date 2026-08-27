@@ -601,6 +601,52 @@ WHERE deleted_at IS NULL
 RETURNING fileset_id;
 """
 
+CREATE_RUN_SQL = """
+INSERT INTO public.collector_run (
+    status
+)
+VALUES (
+    'RUNNING'
+)
+RETURNING run_id;
+"""
+
+FINISH_RUN_SQL = """
+UPDATE public.collector_run
+SET
+    finished_at = now(),
+    status = %(status)s,
+
+    filesets_seen = %(filesets_seen)s,
+    total_bytes_seen = %(total_bytes_seen)s,
+
+    filesets_inserted = %(filesets_inserted)s,
+    filesets_updated = %(filesets_updated)s,
+    filesets_marked_deleted = %(filesets_marked_deleted)s,
+
+    snapshots_written = %(snapshots_written)s,
+    deletion_suppressed = %(deletion_suppressed)s,
+
+    error_message = %(error_message)s
+
+WHERE run_id = %(run_id)s;
+"""
+
+
+FAIL_RUN_SQL = """
+UPDATE public.collector_run
+SET
+    finished_at = now(),
+    status = 'FAILED',
+
+    filesets_seen = %(filesets_seen)s,
+    total_bytes_seen = %(total_bytes_seen)s,
+
+    error_message = %(error_message)s
+
+WHERE run_id = %(run_id)s;
+"""
+
 def connect_omero():
     return psycopg.connect(
         host=OMERO_HOST,
@@ -846,182 +892,366 @@ def process_missing_filesets(
         "suppressed": False,
     }
 
+def create_collector_run():
+    with connect_stats() as conn:
+        row = conn.execute(
+            CREATE_RUN_SQL
+        ).fetchone()
+
+        conn.commit()
+
+        return row["run_id"]
+
+
+def finish_collector_run(
+    conn,
+    run_id,
+    *,
+    status,
+    filesets_seen,
+    total_bytes_seen,
+    filesets_inserted,
+    filesets_updated,
+    filesets_marked_deleted,
+    snapshots_written,
+    deletion_suppressed,
+    error_message=None,
+):
+    conn.execute(
+        FINISH_RUN_SQL,
+        {
+            "run_id": run_id,
+            "status": status,
+            "filesets_seen": filesets_seen,
+            "total_bytes_seen": total_bytes_seen,
+            "filesets_inserted": filesets_inserted,
+            "filesets_updated": filesets_updated,
+            "filesets_marked_deleted":
+                filesets_marked_deleted,
+            "snapshots_written": snapshots_written,
+            "deletion_suppressed":
+                deletion_suppressed,
+            "error_message": error_message,
+        },
+    )
+
+
+def fail_collector_run(
+    run_id,
+    *,
+    filesets_seen,
+    total_bytes_seen,
+    error_message,
+):
+    if run_id is None:
+        return
+
+    try:
+        with connect_stats() as conn:
+            conn.execute(
+                FAIL_RUN_SQL,
+                {
+                    "run_id": run_id,
+                    "filesets_seen": filesets_seen,
+                    "total_bytes_seen":
+                        total_bytes_seen,
+                    "error_message":
+                        str(error_message),
+                },
+            )
+
+            conn.commit()
+
+    except Exception as log_error:
+        print(
+            "WARNING: Could not update "
+            f"collector_run {run_id}: "
+            f"{log_error}",
+            file=sys.stderr,
+        )
+
+def count_inserted_updated(conn, rows):
+    seen_ids = [
+        row["fileset_id"]
+        for row in rows
+    ]
+
+    existing = conn.execute(
+        """
+        SELECT fileset_id
+        FROM public.omero_fileset
+        WHERE fileset_id =
+            ANY(%(ids)s::bigint[])
+        """,
+        {
+            "ids": seen_ids,
+        },
+    ).fetchall()
+
+    existing_ids = {
+        row["fileset_id"]
+        for row in existing
+    }
+
+    inserted = sum(
+        1
+        for fileset_id in seen_ids
+        if fileset_id not in existing_ids
+    )
+
+    updated = len(seen_ids) - inserted
+
+    return inserted, updated
+
 
 def main():
     mode = "DRY RUN" if DRY_RUN else "WRITE MODE"
     print(f"OMERO storage collector - {mode}")
     print()
 
-    # Source connection
-    with connect_omero() as conn:
-        source_info = conn.execute(
-            """
-            SELECT
-                current_database() AS database_name,
-                current_user AS user_name,
-                current_setting(
-                    'default_transaction_read_only'
-                ) AS read_only
-            """
-        ).fetchone()
+    run_id = None
+    filesets_seen = 0
+    total_bytes_seen = 0
 
-        print(
-            "OMERO connection:",
-            source_info["database_name"],
-            source_info["user_name"],
-            f"read_only={source_info['read_only']}",
+    try:
+        if not DRY_RUN:
+            run_id = create_collector_run()
+
+            print(
+                f"Collector run ID: {run_id}"
+            )
+
+        # Source connection
+        with connect_omero() as conn:
+            source_info = conn.execute(
+                """
+                SELECT
+                    current_database() AS database_name,
+                    current_user AS user_name,
+                    current_setting(
+                        'default_transaction_read_only'
+                    ) AS read_only
+                """
+            ).fetchone()
+
+            print(
+                "OMERO connection:",
+                source_info["database_name"],
+                source_info["user_name"],
+                f"read_only={source_info['read_only']}",
+            )
+
+            if source_info["user_name"] != "omero_stats_reader":
+                raise RuntimeError(
+                    "Unexpected OMERO database user."
+                )
+
+            if source_info["read_only"] != "on":
+                raise RuntimeError(
+                    "OMERO connection is not read-only."
+                )
+
+            rows = conn.execute(EXTRACT_SQL).fetchall()
+
+        validate_rows(rows)
+
+        filesets_seen = len(rows)
+
+        total_bytes_seen = sum(
+            row["total_bytes"]
+            for row in rows
         )
 
-        if source_info["user_name"] != "omero_stats_reader":
-            raise RuntimeError(
-                "Unexpected OMERO database user."
+        # Destination connection
+        with connect_stats() as conn:
+            destination_info = conn.execute(
+                """
+                SELECT
+                    current_database() AS database_name,
+                    current_user AS user_name,
+                    (
+                        SELECT count(*)
+                        FROM public.omero_fileset
+                    ) AS existing_filesets
+                """
+            ).fetchone()
+
+            print(
+                "Statistics connection:",
+                destination_info["database_name"],
+                destination_info["user_name"],
+                f"existing_filesets="
+                f"{destination_info['existing_filesets']}",
             )
 
-        if source_info["read_only"] != "on":
-            raise RuntimeError(
-                "OMERO connection is not read-only."
+            if destination_info["user_name"] != "filestats_collector":
+                raise RuntimeError(
+                    "Unexpected statistics database user."
+                )
+
+            DELETION_CONFIRM_RUNS = int(
+                os.getenv("DELETION_CONFIRM_RUNS", "2")
             )
 
-        rows = conn.execute(EXTRACT_SQL).fetchall()
+            DELETION_MIN_SOURCE_RATIO = float(
+                os.getenv("DELETION_MIN_SOURCE_RATIO", "0.80")
+            )
 
-    validate_rows(rows)
+            FORCE_LARGE_DELETION = (
+                os.getenv("FORCE_LARGE_DELETION", "false")
+                .strip()
+                .lower()
+                in {"true", "1", "yes"}
+            )
 
-    # Destination connection
-    with connect_stats() as conn:
-        destination_info = conn.execute(
-            """
-            SELECT
-                current_database() AS database_name,
-                current_user AS user_name,
-                (
+            if not DRY_RUN:
+                print()
+                print("WRITE MODE ENABLED")
+
+                previous_active_count = conn.execute(
+                    """
                     SELECT count(*)
                     FROM public.omero_fileset
-                ) AS existing_filesets
-            """
-        ).fetchone()
+                    WHERE deleted_at IS NULL
+                    """
+                ).fetchone()["count"]
 
-        print(
-            "Statistics connection:",
-            destination_info["database_name"],
-            destination_info["user_name"],
-            f"existing_filesets="
-            f"{destination_info['existing_filesets']}",
+                print(
+                    f"Upserting {len(rows)} Filesets "
+                    "into omero_fileset..."
+                )
+
+                filesets_inserted, filesets_updated = (
+                    count_inserted_updated(
+                        conn,
+                        rows,
+                    )
+                )
+
+                upsert_filesets(conn, rows)
+
+                policies_created = ensure_default_policies(
+                    conn,
+                    rows,
+                )
+
+                deletion_result = process_missing_filesets(
+                    conn,
+                    rows,
+                    previous_active_count,
+                )
+
+                validate_active_policies(conn)
+
+                snapshots_written = write_snapshots(conn)
+
+                if deletion_result["suppressed"]:
+                    run_status = "PARTIAL"
+
+                    run_message = (
+                        "Deletion detection suppressed because "
+                        "the OMERO source inventory was below "
+                        "the configured safety threshold."
+                    )
+                else:
+                    run_status = "SUCCESS"
+                    run_message = None
+
+
+                stored_count = conn.execute(
+                    """
+                    SELECT count(*)
+                    FROM public.omero_fileset
+                    WHERE deleted_at IS NULL
+                    """
+                ).fetchone()["count"]
+
+                finish_collector_run(
+                    conn,
+                    run_id,
+
+                    status=run_status,
+
+                    filesets_seen=filesets_seen,
+                    total_bytes_seen=total_bytes_seen,
+
+                    filesets_inserted=filesets_inserted,
+                    filesets_updated=filesets_updated,
+
+                    filesets_marked_deleted=
+                        deletion_result["deleted"],
+
+                    snapshots_written=snapshots_written,
+
+                    deletion_suppressed=
+                        deletion_result["suppressed"],
+
+                    error_message=run_message,
+                )
+
+                conn.commit()
+
+                print(
+                    f"Default policies created: "
+                    f"{policies_created}"
+                )
+
+                print(
+                    f"Active Filesets after UPSERT: "
+                    f"{stored_count}"
+                )
+
+                print(
+                    f"Storage snapshots written: "
+                    f"{snapshots_written}"
+                )
+
+                print(
+                    f"Filesets currently missing: "
+                    f"{deletion_result['missing']}"
+                )
+
+                print(
+                    f"Filesets marked deleted: "
+                    f"{deletion_result['deleted']}"
+                )
+
+                print(
+                    f"Deletion suppressed: "
+                    f"{deletion_result['suppressed']}"
+                )
+
+        # Report
+        total_bytes = sum(
+            row["total_bytes"]
+            for row in rows
         )
 
-        if destination_info["user_name"] != "filestats_collector":
-            raise RuntimeError(
-                "Unexpected statistics database user."
-            )
+        print()
+        print("Extraction successful")
+        print("---------------------")
+        print(f"Filesets: {len(rows)}")
+        print(f"Total bytes: {total_bytes:,}")
+        print(f"Total decimal GB: {total_bytes / 1_000_000_000:.3f}")
+        print()
 
-        DELETION_CONFIRM_RUNS = int(
-            os.getenv("DELETION_CONFIRM_RUNS", "2")
+        print()
+        if DRY_RUN:
+            print("DRY RUN COMPLETE - no database rows were written.")
+        else:
+            print("WRITE RUN COMPLETE.")
+            
+    except Exception as exc:
+        fail_collector_run(
+            run_id,
+
+            filesets_seen=filesets_seen,
+            total_bytes_seen=total_bytes_seen,
+
+            error_message=exc,
         )
 
-        DELETION_MIN_SOURCE_RATIO = float(
-            os.getenv("DELETION_MIN_SOURCE_RATIO", "0.80")
-        )
-
-        FORCE_LARGE_DELETION = (
-            os.getenv("FORCE_LARGE_DELETION", "false")
-            .strip()
-            .lower()
-            in {"true", "1", "yes"}
-        )
-
-        if not DRY_RUN:
-            print()
-            print("WRITE MODE ENABLED")
-
-            previous_active_count = conn.execute(
-                """
-                SELECT count(*)
-                FROM public.omero_fileset
-                WHERE deleted_at IS NULL
-                """
-            ).fetchone()["count"]
-
-            print(
-                f"Upserting {len(rows)} Filesets "
-                "into omero_fileset..."
-            )
-
-            upsert_filesets(conn, rows)
-
-            policies_created = ensure_default_policies(
-                conn,
-                rows,
-            )
-
-            deletion_result = process_missing_filesets(
-                conn,
-                rows,
-                previous_active_count,
-            )
-
-            validate_active_policies(conn)
-
-            snapshots_written = write_snapshots(conn)
-
-            stored_count = conn.execute(
-                """
-                SELECT count(*)
-                FROM public.omero_fileset
-                WHERE deleted_at IS NULL
-                """
-            ).fetchone()["count"]
-
-            conn.commit()
-
-            print(
-                f"Default policies created: "
-                f"{policies_created}"
-            )
-
-            print(
-                f"Active Filesets after UPSERT: "
-                f"{stored_count}"
-            )
-
-            print(
-                f"Storage snapshots written: "
-                f"{snapshots_written}"
-            )
-
-            print(
-                f"Filesets currently missing: "
-                f"{deletion_result['missing']}"
-            )
-
-            print(
-                f"Filesets marked deleted: "
-                f"{deletion_result['deleted']}"
-            )
-
-            print(
-                f"Deletion suppressed: "
-                f"{deletion_result['suppressed']}"
-            )
-
-    # Report
-    total_bytes = sum(
-        row["total_bytes"]
-        for row in rows
-    )
-
-    print()
-    print("Extraction successful")
-    print("---------------------")
-    print(f"Filesets: {len(rows)}")
-    print(f"Total bytes: {total_bytes:,}")
-    print(f"Total decimal GB: {total_bytes / 1_000_000_000:.3f}")
-    print()
-
-    print()
-    if DRY_RUN:
-        print("DRY RUN COMPLETE - no database rows were written.")
-    else:
-        print("WRITE RUN COMPLETE.")
-
+        raise
 
 if __name__ == "__main__":
     try:
