@@ -732,9 +732,7 @@ def main():
     print(f"OMERO storage collector - {mode}")
     print()
 
-    #
     # Source connection
-    #
     with connect_omero() as conn:
         source_info = conn.execute(
             """
@@ -768,9 +766,7 @@ def main():
 
     validate_rows(rows)
 
-    #
     # Destination connection
-    #
     with connect_stats() as conn:
         destination_info = conn.execute(
             """
@@ -847,19 +843,11 @@ def main():
             conn.commit()
 
             print(
-                f"Default policies created: "
-                f"{policies_created}"
-            )
-
-            print(
                 f"Storage snapshots written: "
                 f"{snapshots_written}"
             )
 
-
-    #
-    # Dry-run report
-    #
+    # Report
     total_bytes = sum(
         row["total_bytes"]
         for row in rows
@@ -872,35 +860,6 @@ def main():
     print(f"Total bytes: {total_bytes:,}")
     print(f"Total decimal GB: {total_bytes / 1_000_000_000:.3f}")
     print()
-
-    for row in rows:
-        print(
-            f"Fileset {row['fileset_id']}: "
-            f"{row['username']} / "
-            f"{row['group_name']} / "
-            f"{row['total_bytes'] / 1_000_000:.1f} MB / "
-            f"{row['source_file_count']} source file(s) / "
-            f"{row['image_count']} image(s) / "
-            f"{row['uncontained_image_count']} uncontained"
-        )
-
-        print(
-            "  source_files:",
-            json.dumps(
-                row["source_files"],
-                ensure_ascii=False,
-                default=str,
-            ),
-        )
-
-        print(
-            "  locations:",
-            json.dumps(
-                row["locations"],
-                ensure_ascii=False,
-                default=str,
-            ),
-        )
 
     print()
     if DRY_RUN:
