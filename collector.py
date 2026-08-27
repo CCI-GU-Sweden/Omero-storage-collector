@@ -223,9 +223,7 @@ LEFT JOIN image_agg ia
 
 LEFT JOIN location_agg la
     ON la.fileset_id = fs.id
-
-WHERE fs.id <> 304
-    
+   
 ORDER BY fs.id;
 """
 
