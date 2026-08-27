@@ -303,20 +303,264 @@ SELECT
     'TEMPORARY',
     28,
     5,
-    CURRENT_DATE
+    %(valid_from)s
 WHERE NOT EXISTS (
     SELECT 1
     FROM public.storage_policy sp
     WHERE sp.group_id = %(group_id)s
-      AND sp.valid_from <= CURRENT_DATE
-      AND (
-          sp.valid_until IS NULL
-          OR sp.valid_until >= CURRENT_DATE
-      )
 )
 ON CONFLICT (group_id, valid_from)
 DO NOTHING
 RETURNING policy_id;
+"""
+
+POLICY_VALIDATION_SQL = """
+WITH params AS (
+    SELECT
+        (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Stockholm')::date
+            AS snapshot_date
+),
+
+active_groups AS (
+    SELECT DISTINCT
+        group_id,
+        group_name
+    FROM public.omero_fileset
+    WHERE deleted_at IS NULL
+)
+
+SELECT
+    ag.group_id,
+    ag.group_name,
+    COUNT(sp.policy_id) AS active_policy_count
+
+FROM active_groups ag
+
+CROSS JOIN params p
+
+LEFT JOIN public.storage_policy sp
+    ON sp.group_id = ag.group_id
+   AND sp.valid_from <= p.snapshot_date
+   AND (
+       sp.valid_until IS NULL
+       OR sp.valid_until >= p.snapshot_date
+   )
+
+GROUP BY
+    ag.group_id,
+    ag.group_name
+
+HAVING COUNT(sp.policy_id) <> 1
+
+ORDER BY ag.group_id;
+"""
+
+SNAPSHOT_SQL = """
+WITH params AS (
+    SELECT
+        (CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Stockholm')::date
+            AS snapshot_date
+),
+
+active_policy AS (
+    SELECT
+        sp.*,
+        p.snapshot_date
+
+    FROM public.storage_policy sp
+
+    CROSS JOIN params p
+
+    WHERE sp.valid_from <= p.snapshot_date
+      AND (
+          sp.valid_until IS NULL
+          OR sp.valid_until >= p.snapshot_date
+      )
+),
+
+calculated AS (
+    SELECT
+        ap.snapshot_date,
+
+        fs.fileset_id,
+        fs.group_id,
+        fs.group_name,
+        fs.total_bytes,
+
+        ap.policy_id,
+        ap.policy_type,
+        ap.grace_days,
+        ap.billing_grace_days,
+        ap.rate_ore_per_gb_day,
+
+        -- TEMPORARY becomes overdue on the calendar day
+        -- after the retention period.
+        CASE
+            WHEN ap.policy_type = 'TEMPORARY'
+             AND ap.snapshot_date >=
+                 fs.imported_at::date
+                 + ap.grace_days
+                 + 1
+            THEN true
+            ELSE false
+        END AS is_overdue,
+
+        -- AGREEMENT is billable immediately.
+        --
+        -- TEMPORARY gets:
+        --   retention grace
+        --   + warning/billing grace
+        -- before billing starts.
+        CASE
+            WHEN ap.policy_type = 'AGREEMENT'
+                THEN true
+
+            WHEN ap.policy_type = 'TEMPORARY'
+             AND ap.snapshot_date >=
+                 fs.imported_at::date
+                 + ap.grace_days
+                 + ap.billing_grace_days
+                 + 1
+            THEN true
+
+            ELSE false
+        END AS is_billable
+
+    FROM public.omero_fileset fs
+
+    JOIN active_policy ap
+        ON ap.group_id = fs.group_id
+
+    WHERE fs.deleted_at IS NULL
+),
+
+grouped AS (
+    SELECT
+        snapshot_date,
+        group_id,
+
+        MAX(group_name) AS group_name,
+
+        policy_id,
+        policy_type,
+        grace_days,
+        billing_grace_days,
+        rate_ore_per_gb_day,
+
+        COUNT(*) AS fileset_count,
+        SUM(total_bytes) AS total_bytes,
+
+        COUNT(*) FILTER (
+            WHERE is_overdue
+        ) AS overdue_fileset_count,
+
+        COALESCE(
+            SUM(total_bytes) FILTER (
+                WHERE is_overdue
+            ),
+            0
+        ) AS overdue_bytes,
+
+        COUNT(*) FILTER (
+            WHERE is_billable
+        ) AS billable_fileset_count,
+
+        COALESCE(
+            SUM(total_bytes) FILTER (
+                WHERE is_billable
+            ),
+            0
+        ) AS billable_bytes
+
+    FROM calculated
+
+    GROUP BY
+        snapshot_date,
+        group_id,
+        policy_id,
+        policy_type,
+        grace_days,
+        billing_grace_days,
+        rate_ore_per_gb_day
+)
+
+INSERT INTO public.group_storage_snapshot (
+    snapshot_date,
+    group_id,
+    group_name,
+
+    policy_id,
+    policy_type,
+    grace_days,
+    billing_grace_days,
+    rate_ore_per_gb_day,
+
+    fileset_count,
+    total_bytes,
+
+    overdue_fileset_count,
+    overdue_bytes,
+
+    billable_fileset_count,
+    billable_bytes,
+
+    collected_at
+)
+
+SELECT
+    snapshot_date,
+    group_id,
+    group_name,
+
+    policy_id,
+    policy_type,
+    grace_days,
+    billing_grace_days,
+    rate_ore_per_gb_day,
+
+    fileset_count,
+    total_bytes,
+
+    overdue_fileset_count,
+    overdue_bytes,
+
+    billable_fileset_count,
+    billable_bytes,
+
+    now()
+
+FROM grouped
+
+ON CONFLICT (snapshot_date, group_id)
+DO UPDATE SET
+    group_name = EXCLUDED.group_name,
+
+    policy_id = EXCLUDED.policy_id,
+    policy_type = EXCLUDED.policy_type,
+    grace_days = EXCLUDED.grace_days,
+    billing_grace_days =
+        EXCLUDED.billing_grace_days,
+    rate_ore_per_gb_day =
+        EXCLUDED.rate_ore_per_gb_day,
+
+    fileset_count = EXCLUDED.fileset_count,
+    total_bytes = EXCLUDED.total_bytes,
+
+    overdue_fileset_count =
+        EXCLUDED.overdue_fileset_count,
+    overdue_bytes =
+        EXCLUDED.overdue_bytes,
+
+    billable_fileset_count =
+        EXCLUDED.billable_fileset_count,
+    billable_bytes =
+        EXCLUDED.billable_bytes,
+
+    collected_at = now()
+
+RETURNING
+    snapshot_date,
+    group_id;
 """
 
 def connect_omero():
@@ -421,20 +665,33 @@ def upsert_filesets(conn, rows):
         
 
 def ensure_default_policies(conn, rows):
-    groups = {
-        row["group_id"]: row["group_name"]
-        for row in rows
-    }
+    groups = {}
+
+    for row in rows:
+        group_id = row["group_id"]
+        imported_date = row["imported_at"].date()
+
+        if group_id not in groups:
+            groups[group_id] = {
+                "group_name": row["group_name"],
+                "valid_from": imported_date,
+            }
+        else:
+            groups[group_id]["group_name"] = row["group_name"]
+
+            if imported_date < groups[group_id]["valid_from"]:
+                groups[group_id]["valid_from"] = imported_date
 
     created = 0
 
     with conn.cursor() as cur:
-        for group_id, group_name in groups.items():
+        for group_id, info in groups.items():
             cur.execute(
                 ENSURE_DEFAULT_POLICY_SQL,
                 {
                     "group_id": group_id,
-                    "group_name": group_name,
+                    "group_name": info["group_name"],
+                    "valid_from": info["valid_from"],
                 },
             )
 
@@ -442,6 +699,32 @@ def ensure_default_policies(conn, rows):
                 created += 1
 
     return created
+
+
+def validate_active_policies(conn):
+    invalid = conn.execute(
+        POLICY_VALIDATION_SQL
+    ).fetchall()
+
+    if invalid:
+        details = ", ".join(
+            f"group {row['group_id']} "
+            f"({row['group_name']}): "
+            f"{row['active_policy_count']} active policies"
+            for row in invalid
+        )
+
+        raise RuntimeError(
+            f"Invalid storage policy configuration: {details}"
+        )
+
+
+def write_snapshots(conn):
+    rows = conn.execute(
+        SNAPSHOT_SQL
+    ).fetchall()
+
+    return len(rows)
 
 
 def main():
@@ -549,6 +832,30 @@ def main():
                 f"Active Filesets after UPSERT: "
                 f"{stored_count}"
             )
+
+            upsert_filesets(conn, rows)
+
+            policies_created = ensure_default_policies(
+                conn,
+                rows,
+            )
+
+            validate_active_policies(conn)
+
+            snapshots_written = write_snapshots(conn)
+
+            conn.commit()
+
+            print(
+                f"Default policies created: "
+                f"{policies_created}"
+            )
+
+            print(
+                f"Storage snapshots written: "
+                f"{snapshots_written}"
+            )
+
 
     #
     # Dry-run report
