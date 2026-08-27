@@ -20,6 +20,21 @@ DRY_RUN = os.getenv("DRY_RUN", "true").strip().lower() not in {
     "no",
 }
 
+DELETION_CONFIRM_RUNS = int(
+    os.getenv("DELETION_CONFIRM_RUNS", "2")
+)
+
+DELETION_MIN_SOURCE_RATIO = float(
+    os.getenv("DELETION_MIN_SOURCE_RATIO", "0.80")
+)
+
+FORCE_LARGE_DELETION = (
+    os.getenv("FORCE_LARGE_DELETION", "false")
+    .strip()
+    .lower()
+    in {"true", "1", "yes"}
+)
+
 def required_env(name: str) -> str:
     value = os.getenv(name)
 
@@ -284,7 +299,6 @@ DO UPDATE SET
     locations = EXCLUDED.locations,
 
     last_seen_at = now(),
-    deleted_at = NULL;
     missing_runs = 0,
     deleted_at = NULL;
 """
@@ -822,10 +836,9 @@ def process_missing_filesets(
 
     seen_count = len(seen_ids)
 
-    #
-    # Initial population: nothing exists yet,
-    # therefore there can be nothing missing.
-    #
+
+    # Initial population: nothing exists yet, therefore there can be nothing missing.
+
     if previous_active_count == 0:
         return {
             "missing": 0,
@@ -1089,21 +1102,6 @@ def main():
                     "Unexpected statistics database user."
                 )
 
-            DELETION_CONFIRM_RUNS = int(
-                os.getenv("DELETION_CONFIRM_RUNS", "2")
-            )
-
-            DELETION_MIN_SOURCE_RATIO = float(
-                os.getenv("DELETION_MIN_SOURCE_RATIO", "0.80")
-            )
-
-            FORCE_LARGE_DELETION = (
-                os.getenv("FORCE_LARGE_DELETION", "false")
-                .strip()
-                .lower()
-                in {"true", "1", "yes"}
-            )
-
             if not DRY_RUN:
                 print()
                 print("WRITE MODE ENABLED")
@@ -1240,7 +1238,7 @@ def main():
             print("DRY RUN COMPLETE - no database rows were written.")
         else:
             print("WRITE RUN COMPLETE.")
-            
+
     except Exception as exc:
         fail_collector_run(
             run_id,
