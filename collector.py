@@ -288,6 +288,37 @@ DO UPDATE SET
     deleted_at = NULL;
 """
 
+ENSURE_DEFAULT_POLICY_SQL = """
+INSERT INTO public.storage_policy (
+    group_id,
+    group_name,
+    policy_type,
+    grace_days,
+    rate_ore_per_gb_day,
+    valid_from
+)
+SELECT
+    %(group_id)s,
+    %(group_name)s,
+    'TEMPORARY',
+    28,
+    5,
+    CURRENT_DATE
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM public.storage_policy sp
+    WHERE sp.group_id = %(group_id)s
+      AND sp.valid_from <= CURRENT_DATE
+      AND (
+          sp.valid_until IS NULL
+          OR sp.valid_until >= CURRENT_DATE
+      )
+)
+ON CONFLICT (group_id, valid_from)
+DO NOTHING
+RETURNING policy_id;
+"""
+
 def connect_omero():
     return psycopg.connect(
         host=OMERO_HOST,
@@ -389,6 +420,30 @@ def upsert_filesets(conn, rows):
         )
         
 
+def ensure_default_policies(conn, rows):
+    groups = {
+        row["group_id"]: row["group_name"]
+        for row in rows
+    }
+
+    created = 0
+
+    with conn.cursor() as cur:
+        for group_id, group_name in groups.items():
+            cur.execute(
+                ENSURE_DEFAULT_POLICY_SQL,
+                {
+                    "group_id": group_id,
+                    "group_name": group_name,
+                },
+            )
+
+            if cur.fetchone() is not None:
+                created += 1
+
+    return created
+
+
 def main():
     mode = "DRY RUN" if DRY_RUN else "WRITE MODE"
     print(f"OMERO storage collector - {mode}")
@@ -462,6 +517,7 @@ def main():
         if not DRY_RUN:
             print()
             print("WRITE MODE ENABLED")
+
             print(
                 f"Upserting {len(rows)} Filesets "
                 "into omero_fileset..."
@@ -469,7 +525,17 @@ def main():
 
             upsert_filesets(conn, rows)
 
+            policies_created = ensure_default_policies(
+                conn,
+                rows,
+            )
+
             conn.commit()
+
+            print(
+                f"Default policies created: "
+                f"{policies_created}"
+            )
 
             stored_count = conn.execute(
                 """
@@ -480,7 +546,8 @@ def main():
             ).fetchone()["count"]
 
             print(
-                f"Active Filesets after UPSERT: {stored_count}"
+                f"Active Filesets after UPSERT: "
+                f"{stored_count}"
             )
 
     #
