@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 
@@ -809,12 +808,9 @@ def main():
                 rows,
             )
 
-            conn.commit()
+            validate_active_policies(conn)
 
-            print(
-                f"Default policies created: "
-                f"{policies_created}"
-            )
+            snapshots_written = write_snapshots(conn)
 
             stored_count = conn.execute(
                 """
@@ -824,29 +820,22 @@ def main():
                 """
             ).fetchone()["count"]
 
+            conn.commit()
+
+            print(
+                f"Default policies created: "
+                f"{policies_created}"
+            )
+
             print(
                 f"Active Filesets after UPSERT: "
                 f"{stored_count}"
             )
 
-            upsert_filesets(conn, rows)
-
-            policies_created = ensure_default_policies(
-                conn,
-                rows,
-            )
-
-            validate_active_policies(conn)
-
-            snapshots_written = write_snapshots(conn)
-
-            conn.commit()
-
             print(
                 f"Storage snapshots written: "
                 f"{snapshots_written}"
             )
-
     # Report
     total_bytes = sum(
         row["total_bytes"]
