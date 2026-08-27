@@ -285,6 +285,8 @@ DO UPDATE SET
 
     last_seen_at = now(),
     deleted_at = NULL;
+    missing_runs = 0,
+    deleted_at = NULL;
 """
 
 ENSURE_DEFAULT_POLICY_SQL = """
@@ -562,6 +564,43 @@ RETURNING
     group_id;
 """
 
+MARK_MISSING_SQL = """
+WITH seen AS (
+    SELECT unnest(%(seen_ids)s::bigint[]) AS fileset_id
+)
+
+UPDATE public.omero_fileset fs
+
+SET
+    missing_since_at = COALESCE(
+        fs.missing_since_at,
+        now()
+    ),
+    missing_runs = fs.missing_runs + 1
+
+WHERE fs.deleted_at IS NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM seen s
+      WHERE s.fileset_id = fs.fileset_id
+  )
+
+RETURNING
+    fs.fileset_id,
+    fs.missing_runs;
+"""
+
+CONFIRM_DELETED_SQL = """
+UPDATE public.omero_fileset
+
+SET deleted_at = now()
+
+WHERE deleted_at IS NULL
+  AND missing_runs >= %(confirm_runs)s
+
+RETURNING fileset_id;
+"""
+
 def connect_omero():
     return psycopg.connect(
         host=OMERO_HOST,
@@ -725,6 +764,88 @@ def write_snapshots(conn):
 
     return len(rows)
 
+def process_missing_filesets(
+    conn,
+    rows,
+    previous_active_count,
+):
+    seen_ids = [
+        row["fileset_id"]
+        for row in rows
+    ]
+
+    seen_count = len(seen_ids)
+
+    #
+    # Initial population: nothing exists yet,
+    # therefore there can be nothing missing.
+    #
+    if previous_active_count == 0:
+        return {
+            "missing": 0,
+            "deleted": 0,
+            "suppressed": False,
+        }
+
+    source_ratio = (
+        seen_count / previous_active_count
+    )
+
+    large_drop = (
+        source_ratio
+        < DELETION_MIN_SOURCE_RATIO
+    )
+
+    if large_drop and not FORCE_LARGE_DELETION:
+        print()
+        print(
+            "WARNING: deletion detection suppressed."
+        )
+        print(
+            f"Previous active Filesets: "
+            f"{previous_active_count}"
+        )
+        print(
+            f"Current OMERO Filesets: "
+            f"{seen_count}"
+        )
+        print(
+            f"Source ratio: "
+            f"{source_ratio:.3f}"
+        )
+        print(
+            "This is below the configured "
+            f"minimum of "
+            f"{DELETION_MIN_SOURCE_RATIO:.3f}."
+        )
+
+        return {
+            "missing": 0,
+            "deleted": 0,
+            "suppressed": True,
+        }
+
+    missing_rows = conn.execute(
+        MARK_MISSING_SQL,
+        {
+            "seen_ids": seen_ids,
+        },
+    ).fetchall()
+
+    deleted_rows = conn.execute(
+        CONFIRM_DELETED_SQL,
+        {
+            "confirm_runs":
+                DELETION_CONFIRM_RUNS,
+        },
+    ).fetchall()
+
+    return {
+        "missing": len(missing_rows),
+        "deleted": len(deleted_rows),
+        "suppressed": False,
+    }
+
 
 def main():
     mode = "DRY RUN" if DRY_RUN else "WRITE MODE"
@@ -792,9 +913,32 @@ def main():
                 "Unexpected statistics database user."
             )
 
+        DELETION_CONFIRM_RUNS = int(
+            os.getenv("DELETION_CONFIRM_RUNS", "2")
+        )
+
+        DELETION_MIN_SOURCE_RATIO = float(
+            os.getenv("DELETION_MIN_SOURCE_RATIO", "0.80")
+        )
+
+        FORCE_LARGE_DELETION = (
+            os.getenv("FORCE_LARGE_DELETION", "false")
+            .strip()
+            .lower()
+            in {"true", "1", "yes"}
+        )
+
         if not DRY_RUN:
             print()
             print("WRITE MODE ENABLED")
+
+            previous_active_count = conn.execute(
+                """
+                SELECT count(*)
+                FROM public.omero_fileset
+                WHERE deleted_at IS NULL
+                """
+            ).fetchone()["count"]
 
             print(
                 f"Upserting {len(rows)} Filesets "
@@ -806,6 +950,12 @@ def main():
             policies_created = ensure_default_policies(
                 conn,
                 rows,
+            )
+
+            deletion_result = process_missing_filesets(
+                conn,
+                rows,
+                previous_active_count,
             )
 
             validate_active_policies(conn)
@@ -836,6 +986,22 @@ def main():
                 f"Storage snapshots written: "
                 f"{snapshots_written}"
             )
+
+            print(
+                f"Filesets currently missing: "
+                f"{deletion_result['missing']}"
+            )
+
+            print(
+                f"Filesets marked deleted: "
+                f"{deletion_result['deleted']}"
+            )
+
+            print(
+                f"Deletion suppressed: "
+                f"{deletion_result['suppressed']}"
+            )
+
     # Report
     total_bytes = sum(
         row["total_bytes"]
