@@ -299,6 +299,7 @@ DO UPDATE SET
     locations = EXCLUDED.locations,
 
     last_seen_at = now(),
+    missing_since_at = NULL,
     missing_runs = 0,
     deleted_at = NULL;
 """
