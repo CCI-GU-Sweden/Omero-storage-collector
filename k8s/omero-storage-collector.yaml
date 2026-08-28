@@ -1,0 +1,76 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: omero-storage-collector
+spec:
+  schedule: "0 7 * * 1-5"
+  timeZone: "Europe/Stockholm"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 1800
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  suspend: true
+
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+
+      template:
+        metadata:
+          labels:
+            app: omero-storage-collector
+
+        spec:
+          restartPolicy: Never
+
+          containers:
+            - name: collector
+
+              image: image-registry.openshift-image-registry.svc:5000/core-omero-test/omero-storage-collector:latest
+              imagePullPolicy: Always
+
+              env:
+                - name: DRY_RUN
+                  value: "false"
+
+                - name: OMERO_DB_HOST
+                  value: "omero-postgres-server"
+
+                - name: OMERO_DB_PORT
+                  value: "5432"
+
+                - name: OMERO_DB_NAME
+                  value: "omerodb"
+
+                - name: OMERO_DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: omero-stats-reader-secret
+                      key: username
+
+                - name: OMERO_DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: omero-stats-reader-secret
+                      key: password
+
+                - name: STATS_DB_HOST
+                  value: "filestatistics-pg15"
+
+                - name: STATS_DB_PORT
+                  value: "5432"
+
+                - name: STATS_DB_NAME
+                  value: "omerofilestats"
+
+                - name: STATS_DB_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: filestats-collector-secret
+                      key: username
+
+                - name: STATS_DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: filestats-collector-secret
+                      key: password
